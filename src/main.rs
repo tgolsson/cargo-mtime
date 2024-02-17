@@ -1,4 +1,4 @@
-//! Small helper binary using Sqlite to maintain an mtime cache
+//! Small helper binary using a file-db to maintain an mtime cache
 //! to avoid unnecessary rebuilds when using Cargo from a sandbox.
 //! This is a workaround for the lack of a `mtime` cache in Cargo.
 //!
@@ -13,8 +13,7 @@ use async_walkdir::Filtering;
 use async_walkdir::WalkDir;
 use filetime::FileTime;
 use futures::StreamExt;
-use rusqlite::Connection;
-use rusqlite::ToSql;
+use jammdb::DB;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -50,104 +49,58 @@ type DatabaseQuery = (String, String, oneshot::Sender<Option<i64>>);
 
 impl Config {
     fn from_env() -> Self {
-        #[cfg(debug_assertions)]
-        {
-            let args = std::env::args().collect::<Vec<_>>();
-            return Self {
-                root_dir: args.get(1).unwrap().to_string(),
-                db_path: std::env::current_dir()
-                    .unwrap()
-                    .join("cargo_mtime.db")
-                    .to_string_lossy()
-                    .to_string(),
-            };
-        }
-        #[cfg(not(debug_assertions))]
-        Self {
-            root_dir: std::env::var("CARGO_MTIME_ROOT").unwrap(),
-            db_path: std::env::var("CARGO_MTIME_DB_PATH").unwrap(),
-        }
+        let args = std::env::args().collect::<Vec<_>>();
+        let root_dir = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| std::env::var("CARGO_MTIME_ROOT").unwrap())
+            .to_string();
+        let db_path = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| std::env::var("CARGO_MTIME_DB_PATH").unwrap())
+            .to_string();
+
+        Self { root_dir, db_path }
     }
 }
 
-fn init_database(config: &Config) -> Result<Connection, rusqlite::Error> {
+fn init_database(config: &Config) -> Result<DB, jammdb::Error> {
     // Create the database if it doesn't exist
-    let conn = rusqlite::Connection::open(&config.db_path)?;
+    let conn = DB::open(&config.db_path)?;
 
-    tracing::info!("Opened database at {}", &config.db_path);
     {
-        // Create metadata table if it doesn't exist
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-			value TEXT
-		)",
-            (),
-        )?;
+        let tx = conn.tx(true)?;
 
-        let mut version = None;
-
-        let mut stmt = conn.prepare("SELECT value FROM metadata WHERE key = 'version'")?;
-        for v in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            version = Some(v?);
-        }
+        let metadata = tx.get_or_create_bucket("metadata")?;
+        let version = metadata.get("version");
 
         match version {
             None => {
-                tracing::info!("Found no version in metadata table, initializing database");
-                conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES ('version', '1')",
-                    (),
-                )?;
-
-                // Create mtime table if it doesn't exist
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS mtime (
-					path TEXT PRIMARY KEY,
-					sha256 TEXT,
-					mtime INTEGER
-				)",
-                    (),
-                )?;
-
-                // Create index on path + sha256
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS mtime_path_sha256 ON mtime (path, sha256)",
-                    (),
-                )?;
+                tx.get_or_create_bucket("mtime")?;
             }
             Some(version) => {
-                if version != "1" {
-                    panic!("Unsupported database version: {}", version);
+                if version.kv().value() != b"1" {
+                    panic!("Unsupported database version: {:?}", version);
                 }
-                tracing::info!("Found version 1 in metadata table, skipping initialization");
             }
         }
+        tx.commit()?;
     }
+
     Ok(conn)
 }
 
-fn try_get_mtime(conn: &Connection, path: &str, sha256: &str, metrics: &Metrics) -> Option<i64> {
-    tracing::trace!(
-        shasum = %sha256,
-        path = %path,
-        "try_get_mtime"
-    );
-
+fn try_get_mtime(conn: &DB, path: &str, sha256: &str, metrics: &Metrics) -> Option<i64> {
     metrics
         .database_mtime_queries
         .fetch_add(1, Ordering::Relaxed);
 
-    let mut stmt = conn
-        .prepare_cached("SELECT mtime FROM mtime WHERE path = ? AND sha256 = ?")
-        .unwrap();
+    let tx = conn.tx(false).unwrap();
 
-    let res = stmt
-        .query(&[path, sha256])
-        .unwrap()
-        .next()
-        .unwrap()
-        .map(|row| row.get(0));
+    let bucket = tx.get_bucket("mtime").unwrap();
+    let shas = bucket.get_bucket(path).ok()?;
+    let res = shas.get(sha256);
 
     if res.is_some() {
         metrics.database_mtime_hits.fetch_add(1, Ordering::Relaxed);
@@ -157,35 +110,30 @@ fn try_get_mtime(conn: &Connection, path: &str, sha256: &str, metrics: &Metrics)
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    res.and_then(std::result::Result::ok)
+    res.map(|mtime| {
+        let mtime = mtime.kv().value();
+        let mtime = i64::from_be_bytes(mtime.try_into().unwrap());
+        mtime
+    })
 }
 
 fn update_database(
-    connection: &Connection,
+    connection: &DB,
     batch: &[(String, String, i64)],
     metrics: &Metrics,
-) -> Result<(), rusqlite::Error> {
-    let stmt = r#"
-INSERT OR REPLACE INTO mtime (path, sha256, mtime) VALUES "#
-        .to_string()
-        + &batch
-            .iter()
-            .map(|_| "(?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ")
-        + r#";
-"#;
-    let mut batch_stmt = connection.prepare(&stmt)?;
+) -> Result<(), jammdb::Error> {
+    let tx = connection.tx(true)?;
 
-    batch_stmt.execute(rusqlite::params_from_iter(batch.iter().flat_map(
-        |(path, sha256, mtime)| {
-            vec![
-                path as &dyn ToSql,
-                sha256 as &dyn ToSql,
-                mtime as &dyn ToSql,
-            ]
-        },
-    )))?;
+    let mtimes = tx.get_bucket("mtime")?;
+
+    for (path, sha256, mtime) in batch {
+        let mtime_bytes = mtime.to_be_bytes();
+
+        let shas = mtimes.get_or_create_bucket(path.as_str())?;
+        shas.put(sha256.as_str(), mtime_bytes)?;
+    }
+
+    tx.commit()?;
 
     metrics
         .database_mtime_write
@@ -197,24 +145,18 @@ INSERT OR REPLACE INTO mtime (path, sha256, mtime) VALUES "#
 async fn database_lookup_task(
     mut query_rx: UnboundedReceiver<DatabaseQuery>,
     metrics: Arc<Metrics>,
-    read_connection: Connection,
+    read_connection: DB,
 ) {
     while let Some((path, sha256, response)) = query_rx.recv().await {
         let path: String = path;
         let sha256: String = sha256;
-
         let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref());
-        tracing::trace!(path = %path, sha256 = %sha256, mtime = ?mtime, "query_handle");
-
         response.send(mtime).unwrap();
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    tracing_subscriber::fmt::init();
-
-    tracing::info!("Installing panic hook");
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_panic(info);
@@ -225,13 +167,13 @@ async fn main() {
 
     let config = Config::from_env();
     let connection = init_database(&config).unwrap();
-
+    let read_connection = connection.clone();
     // We'll use a single worker to write to the database, taking requests from all the other workers.
     let (tx, rx) = unbounded_channel();
     let handle = tokio::spawn(gather_submit_db(rx, connection, metrics.clone()));
 
     // We'll also use a single worker to read from the database, taking requests from all the other workers.
-    let read_connection = init_database(&config).unwrap();
+
     let (query_tx, query_rx) = unbounded_channel::<DatabaseQuery>();
     let query_handle = tokio::spawn(database_lookup_task(
         query_rx,
@@ -240,7 +182,7 @@ async fn main() {
     ));
 
     // We'll use a semaphore to limit the number of concurrent file operations, to avoid running out of file descriptors.
-    let semaphore = Arc::new(Semaphore::new(512));
+    let semaphore = Arc::new(Semaphore::new(768));
     let mut entries = WalkDir::new(&config.root_dir).filter(|entry| async move {
         if let Some(true) = entry
             .path()
@@ -272,7 +214,6 @@ async fn main() {
 
                 let tx = tx.clone();
                 let query_tx = query_tx.clone();
-
                 let semaphore = semaphore.clone();
                 let permit = semaphore.acquire_owned().await.unwrap();
                 tokio::spawn(manage_mtime(entry, query_tx, permit, tx, metrics.clone()));
@@ -291,11 +232,13 @@ async fn main() {
 
     handle.await.unwrap();
     query_handle.await.unwrap();
+
+    dbg!(metrics);
 }
 
 async fn gather_submit_db(
     mut rx: UnboundedReceiver<(String, String, i64)>,
-    connection: Connection,
+    connection: DB,
     metrics: Arc<Metrics>,
 ) {
     let mut current_batch: Vec<(String, String, i64)> = vec![];
@@ -322,7 +265,9 @@ async fn manage_mtime(
     metrics: Arc<Metrics>,
 ) {
     let path = entry.path();
+
     let (sha256, metadata) = tokio::join!(sha256::try_async_digest(&path), entry.metadata(),);
+    drop(entry);
     let sha256 = sha256.unwrap();
 
     let mtime_on_disk =
