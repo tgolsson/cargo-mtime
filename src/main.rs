@@ -14,6 +14,8 @@ use async_walkdir::WalkDir;
 use filetime::FileTime;
 use futures::StreamExt;
 use jammdb::DB;
+use speedy::Readable;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -47,6 +49,8 @@ struct Metrics {
 
 type DatabaseQuery = (String, String, oneshot::Sender<Option<i64>>);
 
+pub type Database = BTreeMap<String, BTreeMap<String, i64>>;
+
 impl Config {
     fn from_env() -> Self {
         let args = std::env::args().collect::<Vec<_>>();
@@ -65,19 +69,25 @@ impl Config {
     }
 }
 
+#[derive(speedy::Readable, speedy::Writable, Debug)]
+struct AppState {
+    #[sp]
+    version: u32,
+    mtime: BTreeMap<String, BTreeMap<String, i64>>,
+}
 fn init_database(config: &Config) -> Result<DB, jammdb::Error> {
     // Create the database if it doesn't exist
-    let conn = DB::open(&config.db_path)?;
+    let file = std::fs::read(&config.db_path).unwrap_or_default();
+    let conn = Database::read_from_buffer(&file).unwrap();
 
     {
-        let tx = conn.tx(true)?;
-
         let metadata = tx.get_or_create_bucket("metadata")?;
         let version = metadata.get("version");
 
         match version {
             None => {
                 tx.get_or_create_bucket("mtime")?;
+                tx.commit()?;
             }
             Some(version) => {
                 if version.kv().value() != b"1" {
@@ -85,7 +95,6 @@ fn init_database(config: &Config) -> Result<DB, jammdb::Error> {
                 }
             }
         }
-        tx.commit()?;
     }
 
     Ok(conn)
@@ -122,22 +131,22 @@ fn update_database(
     batch: &[(String, String, i64)],
     metrics: &Metrics,
 ) -> Result<(), jammdb::Error> {
-    let tx = connection.tx(true)?;
+    // let tx = connection.tx(true)?;
 
-    let mtimes = tx.get_bucket("mtime")?;
+    // let mtimes = tx.get_bucket("mtime")?;
 
-    for (path, sha256, mtime) in batch {
-        let mtime_bytes = mtime.to_be_bytes();
+    // for (path, sha256, mtime) in batch {
+    //     let mtime_bytes = mtime.to_be_bytes();
 
-        let shas = mtimes.get_or_create_bucket(path.as_str())?;
-        shas.put(sha256.as_str(), mtime_bytes)?;
-    }
+    //     let shas = mtimes.get_or_create_bucket(path.as_str())?;
+    //     shas.put(sha256.as_str(), mtime_bytes)?;
+    // }
 
-    tx.commit()?;
+    // tx.commit()?;
 
-    metrics
-        .database_mtime_write
-        .fetch_add(batch.len(), Ordering::Relaxed);
+    // metrics
+    //     .database_mtime_write
+    //     .fetch_add(batch.len(), Ordering::Relaxed);
 
     Ok(())
 }
