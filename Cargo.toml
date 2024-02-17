@@ -1,5 +1,5 @@
 [package]
-name = "cargo-mtime-memoize"
+name = "cargo-mtime"
 version = "0.1.0"
 edition = "2021"
 
@@ -13,6 +13,3 @@ futures = "0.3.30"
 sha256 = "1.5.0"
 speedy = "0.8.7"
 tokio = { version = "1.36.0", features = ["rt-multi-thread", "fs", "io-std", "io-util", "sync", "macros", "signal"] }
-
-[profile.release]
-debug = true
