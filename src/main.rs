@@ -11,10 +11,12 @@
 use async_walkdir::DirEntry;
 use async_walkdir::Filtering;
 use async_walkdir::WalkDir;
+use color_eyre::eyre::Context;
+use color_eyre::eyre::Result;
 use filetime::FileTime;
 use futures::StreamExt;
-use jammdb::DB;
 use speedy::Readable;
+use speedy::Writable;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -24,6 +26,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
@@ -69,47 +72,47 @@ impl Config {
     }
 }
 
-#[derive(speedy::Readable, speedy::Writable, Debug)]
+#[derive(speedy::Readable, speedy::Writable, Debug, Default)]
 struct AppState {
-    #[sp]
-    version: u32,
-    mtime: BTreeMap<String, BTreeMap<String, i64>>,
+    version: Option<u32>,
+    mtime: Database,
 }
-fn init_database(config: &Config) -> Result<DB, jammdb::Error> {
+
+type DB = Arc<RwLock<AppState>>;
+
+fn init_database(config: &Config) -> Result<DB> {
     // Create the database if it doesn't exist
     let file = std::fs::read(&config.db_path).unwrap_or_default();
-    let conn = Database::read_from_buffer(&file).unwrap();
+    let mut conn = if file.is_empty() {
+        Ok(AppState::default())
+    } else {
+        AppState::read_from_buffer(&file).wrap_err("Failed to read database")
+    }?;
 
-    {
-        let metadata = tx.get_or_create_bucket("metadata")?;
-        let version = metadata.get("version");
+    let version = conn.version;
 
-        match version {
-            None => {
-                tx.get_or_create_bucket("mtime")?;
-                tx.commit()?;
-            }
-            Some(version) => {
-                if version.kv().value() != b"1" {
-                    panic!("Unsupported database version: {:?}", version);
-                }
+    match version {
+        None => {
+            conn.version = Some(1);
+        }
+        Some(version) => {
+            if version != 1 {
+                panic!("Unsupported database version: {:?}", version);
             }
         }
     }
 
-    Ok(conn)
+    Ok(Arc::new(RwLock::new(conn)))
 }
 
-fn try_get_mtime(conn: &DB, path: &str, sha256: &str, metrics: &Metrics) -> Option<i64> {
+async fn try_get_mtime(conn: &DB, path: &str, sha256: &str, metrics: &Metrics) -> Option<i64> {
     metrics
         .database_mtime_queries
         .fetch_add(1, Ordering::Relaxed);
 
-    let tx = conn.tx(false).unwrap();
+    let r = conn.read().await;
 
-    let bucket = tx.get_bucket("mtime").unwrap();
-    let shas = bucket.get_bucket(path).ok()?;
-    let res = shas.get(sha256);
+    let res = r.mtime.get(path).and_then(|x| x.get(sha256));
 
     if res.is_some() {
         metrics.database_mtime_hits.fetch_add(1, Ordering::Relaxed);
@@ -119,52 +122,42 @@ fn try_get_mtime(conn: &DB, path: &str, sha256: &str, metrics: &Metrics) -> Opti
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    res.map(|mtime| {
-        let mtime = mtime.kv().value();
-        let mtime = i64::from_be_bytes(mtime.try_into().unwrap());
-        mtime
-    })
+    res.copied()
 }
 
-fn update_database(
+async fn update_database(
     connection: &DB,
-    batch: &[(String, String, i64)],
+    batch: &mut Vec<(String, String, i64)>,
     metrics: &Metrics,
-) -> Result<(), jammdb::Error> {
-    // let tx = connection.tx(true)?;
+) {
+    let mut conn = connection.write().await;
 
-    // let mtimes = tx.get_bucket("mtime")?;
+    for (path, sha256, mtime) in batch.drain(..) {
+        let mtime_map = conn.mtime.entry(path).or_insert_with(BTreeMap::new);
+        mtime_map.insert(sha256, mtime);
+    }
 
-    // for (path, sha256, mtime) in batch {
-    //     let mtime_bytes = mtime.to_be_bytes();
-
-    //     let shas = mtimes.get_or_create_bucket(path.as_str())?;
-    //     shas.put(sha256.as_str(), mtime_bytes)?;
-    // }
-
-    // tx.commit()?;
-
-    // metrics
-    //     .database_mtime_write
-    //     .fetch_add(batch.len(), Ordering::Relaxed);
-
-    Ok(())
+    metrics
+        .database_mtime_write
+        .fetch_add(batch.len(), Ordering::Relaxed);
 }
 
 async fn database_lookup_task(
     mut query_rx: UnboundedReceiver<DatabaseQuery>,
     metrics: Arc<Metrics>,
     read_connection: DB,
-) {
+) -> Result<()> {
     while let Some((path, sha256, response)) = query_rx.recv().await {
         let path: String = path;
         let sha256: String = sha256;
-        let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref());
+        let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref()).await;
         response.send(mtime).unwrap();
     }
+
+    Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -176,6 +169,7 @@ async fn main() {
 
     let config = Config::from_env();
     let connection = init_database(&config).unwrap();
+    let connection2 = connection.clone();
     let read_connection = connection.clone();
     // We'll use a single worker to write to the database, taking requests from all the other workers.
     let (tx, rx) = unbounded_channel();
@@ -224,8 +218,14 @@ async fn main() {
                 let tx = tx.clone();
                 let query_tx = query_tx.clone();
                 let semaphore = semaphore.clone();
-                let permit = semaphore.acquire_owned().await.unwrap();
-                tokio::spawn(manage_mtime(entry, query_tx, permit, tx, metrics.clone()));
+
+                tokio::spawn(manage_mtime(
+                    entry,
+                    query_tx,
+                    semaphore,
+                    tx,
+                    metrics.clone(),
+                ));
             }
             Some(Err(e)) => {
                 eprintln!("error: {}", e);
@@ -243,6 +243,11 @@ async fn main() {
     query_handle.await.unwrap();
 
     dbg!(metrics);
+
+    let mut conn = connection2.read().await;
+    let mut buffer = conn.write_to_vec().unwrap();
+
+    std::fs::write(&config.db_path, buffer).unwrap();
 }
 
 async fn gather_submit_db(
@@ -256,23 +261,23 @@ async fn gather_submit_db(
         current_batch.push((path, sha256, mtime));
 
         if current_batch.len() >= 100 {
-            update_database(&connection, &current_batch, metrics.as_ref()).unwrap();
-            current_batch.clear();
+            update_database(&connection, &mut current_batch, metrics.as_ref()).await;
         }
     }
 
     if !current_batch.is_empty() {
-        update_database(&connection, &current_batch, metrics.as_ref()).unwrap();
+        update_database(&connection, &mut current_batch, metrics.as_ref()).await
     }
 }
 
 async fn manage_mtime(
     entry: DirEntry,
     query_tx: UnboundedSender<DatabaseQuery>,
-    permit: OwnedSemaphorePermit,
+    permit: Arc<Semaphore>,
     tx: UnboundedSender<(String, String, i64)>,
     metrics: Arc<Metrics>,
 ) {
+    let permit = permit.acquire().await.unwrap();
     let path = entry.path();
 
     let (sha256, metadata) = tokio::join!(sha256::try_async_digest(&path), entry.metadata(),);
