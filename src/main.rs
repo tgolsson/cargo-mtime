@@ -25,7 +25,6 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
@@ -240,13 +239,12 @@ async fn main() {
     drop(semaphore);
 
     handle.await.unwrap();
-    query_handle.await.unwrap();
+    query_handle.await.unwrap().unwrap();
 
     dbg!(metrics);
 
-    let mut conn = connection2.read().await;
-    let mut buffer = conn.write_to_vec().unwrap();
-
+    let conn = connection2.read().await;
+    let buffer = conn.write_to_vec().unwrap();
     std::fs::write(&config.db_path, buffer).unwrap();
 }
 
