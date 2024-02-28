@@ -50,11 +50,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.cross }}
-          command: test
-          args: --release --locked --target ${{ matrix.target }}
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
