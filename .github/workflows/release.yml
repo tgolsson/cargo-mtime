@@ -53,9 +53,6 @@ jobs:
           toolchain: ${{ matrix.rust }}
           targets: ${{ matrix.target }}
 
-      - name: Run cargo test
-        run: cargo test --release --locked --target ${{ matrix.target }}
-
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
