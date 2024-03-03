@@ -78,7 +78,10 @@ jobs:
           submodules: false
 
       - uses: actions/download-artifact@v4
-      - run: ls -al cargo-mtime-*
+        with:
+          path: bins
+          merge-multiple: true
+      - run: ls -al bins/*
 
       - name: Calculate tag name
         run: |
@@ -94,7 +97,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: cargo-mtime-*
+          file: bins/*
           file_glob: true
           tag: ${{ steps.tagname.outputs.val }}
           overwrite: true
