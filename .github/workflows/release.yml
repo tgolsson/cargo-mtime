@@ -11,78 +11,49 @@ env:
 
 jobs:
   dist:
-    name: Dist
-    runs-on: ${{ matrix.os }}
+    name: Release - ${{ matrix.platform.release_for }}
     strategy:
-      fail-fast: false # don't fail other jobs if one fails
       matrix:
-        build: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos, x86_64-windows]
-        include:
-        - build: x86_64-linux
-          os: ubuntu-20.04
-          rust: stable
-          target: x86_64-unknown-linux-gnu
+        platform:
+          - release_for: macOS-x86_64
+            os: macOS-latest
+            target: x86_64-apple-darwin
+            bin: cargo-mtime
+            name: cargo-mtime-Darwin-x86_64.tar.gz
+            command: both
 
-        - build: aarch64-linux
-          os: ubuntu-20.04
-          rust: stable
-          target: aarch64-unknown-linux-gnu
+          - release_for: macOS-aarch64
+            os: macOS-latest
+            target: aarch64-apple-darwin
+            bin: cargo-mtime
+            name: cargo-mtime-Darwin-aarch64.tar.gz
+            command: both
 
-        - build: x86_64-macos
-          os: macos-latest
-          rust: stable
-          target: x86_64-apple-darwin
+          - release_for: linux-x86_64
+            os: linux-latest
+            target: x86_64-unknown-linux-gnu
+            bin: cargo-mtime
+            name: cargo-mtime-linux-x86_64.tar.gz
+            command: both
 
-        - build: aarch64-macos
-          os: macos-latest
-          rust: stable
-          target: aarch64-apple-darwin
+          - release_for: linux-x86_64
+            os: linux-latest
+            target: x86_64-unknown-linux-gnu
+            bin: cargo-mtime
+            name: cargo-mtime-linux-x86_64.tar.gz
+            command: both
 
-        - build: x86_64-windows
-          os: windows-2019
-          rust: stable
-          target: x86_64-pc-windows-msvc
-
+    runs-on: ${{ matrix.platform.os }}
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install ${{ matrix.rust }} toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v0
         with:
-          toolchain: ${{ matrix.rust }}
-          targets: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Strip release binary (linux and macos)
-        if: matrix.build == 'x86_64-linux' || matrix.build == 'x86_64-macos'
-        run: strip "target/${{ matrix.target }}/release/$BIN_NAME"
-
-      - name: Strip release binary (arm)
-        if: matrix.build == 'aarch64-linux'
-        run: |
-          docker run --rm -v \
-            "$PWD/target:/target:Z" \
-            rustembedded/cross:${{ matrix.target }} \
-            aarch64-linux-gnu-strip \
-            /target/${{ matrix.target }}/release/$BIN_NAME
-
-      - name: Build archive
-        shell: bash
-        run: |
-          mkdir dist
-          if [ "${{ matrix.os }}" = "windows-2019" ]; then
-            cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/"
-          else
-            cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/"
-          fi
-
-      - uses: actions/upload-artifact@v2.2.4
-        with:
-          name: bins-${{ matrix.build }}
-          path: dist
+          command: ${{ matrix.platform.command }}
+          target: ${{ matrix.platform.target }}
+          args: "--locked --release"
+          strip: true
 
   publish:
     name: Publish
