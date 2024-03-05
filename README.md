@@ -1,11 +1,11 @@
-# `cargo-mtime-memoize`
+# `cargo-mtime`
 
 This is a small utility that can be used to manage mtimes for
 sandboxed compilation with Cargo. Since Cargo relies on file-system
 mtime information for invalidating builds, moving files to a temporary
 directory for builds will also trigger large rebuilds. There has been
-a few attempts at solving this upstream, but no solution seems to be
-good enough.
+a few attempts at solving this upstream, but nothing has been
+stabilized or accepted.
 
 I'm working on supporting Rust in Pants, which uses sha-based caching
 at the top already, which means that it is *always* going to be more

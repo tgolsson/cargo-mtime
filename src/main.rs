@@ -241,8 +241,6 @@ async fn main() {
     handle.await.unwrap();
     query_handle.await.unwrap().unwrap();
 
-    dbg!(metrics);
-
     let conn = connection2.read().await;
     let buffer = conn.write_to_vec().unwrap();
     std::fs::write(&config.db_path, buffer).unwrap();
@@ -268,6 +266,11 @@ async fn gather_submit_db(
     }
 }
 
+/// Attempts to set the mtime of the file on disk such that:
+///
+/// * If we have no record, we store current file mtime, sha256, and path to the database
+/// * If the sha256 is different, we *record* the mtime and sha256 of the file but do not touch it
+/// * If the sha256 is the same, we set the mtime of the file to the recorded previous time
 async fn manage_mtime(
     entry: DirEntry,
     query_tx: UnboundedSender<DatabaseQuery>,
