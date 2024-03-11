@@ -18,14 +18,14 @@ jobs:
             os: macOS-latest
             target: x86_64-apple-darwin
             bin: cargo-mtime
-            name: cargo-mtime-Darwin-x86_64.tar.gz
+            name: cargo-mtime-darwin-x86_64.tar.gz
             command: build
 
           - release_for: macOS-aarch64
             os: macOS-latest
             target: aarch64-apple-darwin
             bin: cargo-mtime
-            name: cargo-mtime-Darwin-aarch64.tar.gz
+            name: cargo-mtime-darwin-aarch64.tar.gz
             command: build
 
           - release_for: linux-x86_64
