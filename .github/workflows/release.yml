@@ -18,28 +18,24 @@ jobs:
             os: macOS-latest
             target: x86_64-apple-darwin
             bin: cargo-mtime
-            name: cargo-mtime-darwin-x86_64.tar.gz
             command: build
 
           - release_for: macOS-aarch64
             os: macOS-latest
             target: aarch64-apple-darwin
             bin: cargo-mtime
-            name: cargo-mtime-darwin-aarch64.tar.gz
             command: build
 
           - release_for: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: cargo-mtime
-            name: cargo-mtime-linux-x86_64.tar.gz
             command: build
 
           - release_for: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             bin: cargo-mtime
-            name: cargo-mtime-linux-aarch64.tar.gz
             command: build
 
     runs-on: ${{ matrix.platform.os }}
@@ -53,18 +49,27 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: "--locked --release"
           strip: true
+      - name: Calculate tag name
+        run: |
+          name=dev
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            name=${GITHUB_REF:10}
+          fi
+          echo ::set-output name=val::$name
+          echo TAG=$name >> $GITHUB_ENV
+        id: tagname
 
       - name: Package as archive
         shell: bash
         run: |
           cd target/${{ matrix.platform.target }}/release
-          tar czvf ../../../${{ matrix.platform.name }} ${{ matrix.platform.bin }}
+          tar czvf ../../../cargo-mtime-${{ matrix.platform.target }}-${{ steps.tagname.outputs.val }}.tar.gz ${{ matrix.platform.bin }}
           cd -
 
       - name: Publish release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform.name }}
+          name: cargo-mtime-${{ matrix.platform.target }}-${{ steps.tagname.outputs.val }}
           path: "cargo-mtime-*"
 
   publish:
