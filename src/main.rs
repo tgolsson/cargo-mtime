@@ -34,6 +34,24 @@ struct Config {
     db_path: String,
 }
 
+impl Config {
+    fn from_env() -> Self {
+        let args = std::env::args().collect::<Vec<_>>();
+        let root_dir = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| std::env::var("CARGO_MTIME_ROOT").unwrap())
+            .to_string();
+        let db_path = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| std::env::var("CARGO_MTIME_DB_PATH").unwrap())
+            .to_string();
+
+        Self { root_dir, db_path }
+    }
+}
+
 #[derive(Default, Debug)]
 struct Metrics {
     files_processed: AtomicUsize,
@@ -52,24 +70,6 @@ struct Metrics {
 type DatabaseQuery = (String, String, oneshot::Sender<Option<i64>>);
 
 pub type Database = BTreeMap<String, BTreeMap<String, i64>>;
-
-impl Config {
-    fn from_env() -> Self {
-        let args = std::env::args().collect::<Vec<_>>();
-        let root_dir = args
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| std::env::var("CARGO_MTIME_ROOT").unwrap())
-            .to_string();
-        let db_path = args
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| std::env::var("CARGO_MTIME_DB_PATH").unwrap())
-            .to_string();
-
-        Self { root_dir, db_path }
-    }
-}
 
 #[derive(speedy::Readable, speedy::Writable, Debug, Default)]
 struct AppState {
@@ -243,6 +243,13 @@ async fn main() {
 
     let conn = connection2.read().await;
     let buffer = conn.write_to_vec().unwrap();
+
+    let path = std::path::PathBuf::from(&config.db_path);
+
+    let prefix = path.parent();
+    if let Some(prefix) = prefix {
+        std::fs::create_dir_all(prefix).unwrap();
+    }
     std::fs::write(&config.db_path, buffer).unwrap();
 }
 
